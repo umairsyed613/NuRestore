@@ -6,12 +6,22 @@ Set-Location $projectRoot
 
 Write-Host "Installing NuRestore as a command-line tool..."
 
-python -m pip install --upgrade pip
+# Bootstrap pip if it is not already installed
+python -m pip --version 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "pip not found, bootstrapping via ensurepip..."
+    python -m ensurepip --upgrade --user
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to bootstrap pip via ensurepip."
+    }
+}
+
+python -m pip install --upgrade pip --user
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to upgrade pip."
 }
 
-python -m pip install .
+python -m pip install --user .
 if ($LASTEXITCODE -ne 0) {
     throw "Installation failed."
 }
