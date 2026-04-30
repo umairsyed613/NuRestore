@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "nurestore"
+version = "1.0.0"
+description = "Lightweight GUI tool for managing NuGet packages on .NET projects"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "customtkinter>=5.2",
+]
+
+[project.scripts]
+nurestore = "nurestore:main"
+
+[tool.setuptools]
+py-modules = ["nurestore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.unittest]
+start-dir = "tests"
