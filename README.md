@@ -4,6 +4,11 @@ A lightweight, portable GUI application for managing NuGet packages on .NET proj
 
 ---
 
+## Screenshot
+
+![NuRestore Screenshot](ss.png)
+
+
 ## Features
 
 - **Browse** — Search for packages on any NuGet feed with live results, download counts, and author info
