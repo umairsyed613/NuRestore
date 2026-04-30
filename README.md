@@ -61,6 +61,16 @@ Run the install script from the project root to register `nurestore` as a global
 .\scripts\install_cli.ps1
 ```
 
+Install scope behavior:
+
+- Non-elevated PowerShell: installs for the current user and updates User PATH.
+- Elevated PowerShell (Run as Administrator): installs for all users and updates Machine PATH.
+- Force all-users install explicitly:
+
+```powershell
+.\scripts\install_cli.ps1 -AllUsers
+```
+
 After installation you can launch the app from any folder:
 
 ```powershell
@@ -80,6 +90,24 @@ Run the PowerShell build script from the project root:
 ```
 
 The output is written to `dist\NuRestorePortable.exe`. This file is fully self-contained and requires no Python or additional libraries.
+
+Optional: install portable build and add Explorer right-click integration:
+
+```powershell
+# Explicit build-only mode
+.\scripts\build_portable.ps1 -BuildOnly
+
+# Current user install + context menu
+.\scripts\build_portable.ps1 -Install
+
+# All users install + context menu (run as Administrator)
+.\scripts\build_portable.ps1 -Install -AllUsers
+
+# Register context menu only (no copy/install)
+.\scripts\build_portable.ps1 -RegisterContextMenu
+```
+
+This adds an `Open with NuRestore` entry when right-clicking a folder or the background inside a folder in Windows Explorer.
 
 ---
 
@@ -123,7 +151,7 @@ Settings are stored in `nurestore.settings.json` alongside the executable (or sc
 
 ## Project Structure
 
-```
+```text
 nurestore.py                        Main application
 nurestore_portable.spec             PyInstaller spec for single-file build
 nurestore.settings.json             User settings (auto-generated)
