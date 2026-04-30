@@ -49,6 +49,26 @@ pip install customtkinter
 
 ```bash
 python nurestore.py
+# or open a specific directory directly
+python nurestore.py D:\MyProject
+```
+
+### Install as a CLI command
+
+Run the install script from the project root to register `nurestore` as a global command:
+
+```powershell
+.\scripts\install_cli.ps1
+```
+
+After installation you can launch the app from any folder:
+
+```powershell
+# Opens in the current directory
+nurestore
+
+# Opens with a specific directory
+nurestore D:\MyProject
 ```
 
 ### Build portable `.exe`
@@ -56,7 +76,7 @@ python nurestore.py
 Run the PowerShell build script from the project root:
 
 ```powershell
-.\build_portable.ps1
+.\scripts\build_portable.ps1
 ```
 
 The output is written to `dist\NuRestorePortable.exe`. This file is fully self-contained and requires no Python or additional libraries.
@@ -104,11 +124,20 @@ Settings are stored in `nurestore.settings.json` alongside the executable (or sc
 ## Project Structure
 
 ```
-nurestore.py                  Main application
-nurestore.settings.json       User settings (auto-generated)
-nurestore_portable.spec       PyInstaller spec for single-file build
-build_portable.ps1            PowerShell script to build the portable exe
-test_nurestore.py             Unit tests
+nurestore.py                        Main application
+nurestore_portable.spec             PyInstaller spec for single-file build
+nurestore.settings.json             User settings (auto-generated)
+scripts/
+  build_portable.ps1                Builds the portable .exe with PyInstaller
+  install_cli.ps1                   Installs nurestore as a global CLI command
+tests/
+  test_nurestore.py                 Unit tests
+```
+
+### Running tests
+
+```bash
+python -m unittest discover -s tests
 ```
 
 ---
