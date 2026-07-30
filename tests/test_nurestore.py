@@ -21,6 +21,18 @@ class VersionGtTests(unittest.TestCase):
         self.assertFalse(nm._version_gt("1.0.0", "1.0.0+build"))
 
 
+class OperationOutcomeTests(unittest.TestCase):
+    def test_operation_outcome_success(self):
+        self.assertEqual(nm._operation_outcome(5, 0), "success")
+
+    def test_operation_outcome_partial(self):
+        self.assertEqual(nm._operation_outcome(5, 2), "partial")
+
+    def test_operation_outcome_failure(self):
+        self.assertEqual(nm._operation_outcome(5, 5), "failure")
+        self.assertEqual(nm._operation_outcome(0, 0), "failure")
+
+
 class NuGetSourceTests(unittest.TestCase):
     def test_copy_is_independent(self):
         s = nm.NuGetSource("k", "https://x/v3", True, "u", "p", "User", True)
@@ -90,6 +102,59 @@ class ParseConfigTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertTrue(loaded.origin.startswith("Loaded Config"))
         self.assertFalse(loaded.user_managed)
+
+
+class SolutionParsingTests(unittest.TestCase):
+    def test_parse_slnx_discovers_project_paths(self):
+        xml = textwrap.dedent("""\
+            <?xml version="1.0" encoding="utf-8"?>
+            <Solution>
+              <Folder Name="src">
+                <Project Path="src/App/App.csproj" />
+                <Project Path="src/Lib/Lib.fsproj" />
+                <Project Path="src/Tools/Tools.vbproj" />
+              </Folder>
+            </Solution>
+            """)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src", "App"), exist_ok=True)
+            os.makedirs(os.path.join(tmp, "src", "Lib"), exist_ok=True)
+            os.makedirs(os.path.join(tmp, "src", "Tools"), exist_ok=True)
+
+            app = os.path.join(tmp, "src", "App", "App.csproj")
+            lib = os.path.join(tmp, "src", "Lib", "Lib.fsproj")
+            tools = os.path.join(tmp, "src", "Tools", "Tools.vbproj")
+            for path in (app, lib, tools):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("<Project />")
+
+            slnx = os.path.join(tmp, "Sample.slnx")
+            with open(slnx, "w", encoding="utf-8") as f:
+                f.write(xml)
+
+            found = nm._parse_slnx(slnx)
+
+        self.assertEqual(found, [app, lib, tools])
+
+    def test_parse_sln_still_works(self):
+        sln = textwrap.dedent("""\
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App", "src\\App\\App.csproj", "{GUID}"
+            EndProject
+            """)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "src", "App"), exist_ok=True)
+            app = os.path.join(tmp, "src", "App", "App.csproj")
+            with open(app, "w", encoding="utf-8") as f:
+                f.write("<Project />")
+
+            sln_path = os.path.join(tmp, "Sample.sln")
+            with open(sln_path, "w", encoding="utf-8") as f:
+                f.write(sln)
+
+            found = nm._parse_sln(sln_path)
+
+        self.assertEqual(found, [app])
 
 
 class SettingsTests(unittest.TestCase):

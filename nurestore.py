@@ -104,6 +104,21 @@ def _optimal_workers(item_count: int, *, base: int = 4, cap: int = 24) -> int:
     return max(1, min(cap, suggested, item_count if item_count > 0 else 1))
 
 
+def _operation_outcome(total_count: int, error_count: int) -> str:
+    """Classify operation outcome as success, partial, or failure."""
+    if total_count <= 0:
+        return "failure"
+    if error_count <= 0:
+        return "success"
+    if error_count >= total_count:
+        return "failure"
+    return "partial"
+
+
+_PROJECT_FILE_EXTENSIONS = (".csproj", ".fsproj", ".vbproj")
+_SOLUTION_FILE_EXTENSIONS = (".sln", ".slnx")
+
+
 # ── NuGet source ──────────────────────────────────────────────────────────────
 
 class NuGetSource:
@@ -268,6 +283,59 @@ def _load_all_sources(base_dir: str,
                               "https://api.nuget.org/v3/index.json",
                               True, "", "", "Default", True)]
     return result
+
+
+def _resolve_solution_project_path(solution_dir: str, raw_path: str) -> str | None:
+    raw_path = raw_path.strip().strip("\"").strip("'")
+    if not raw_path or not raw_path.lower().endswith(_PROJECT_FILE_EXTENSIONS):
+        return None
+
+    full = os.path.normpath(os.path.join(solution_dir, raw_path))
+    return full if os.path.isfile(full) else None
+
+
+def _parse_sln(sln_path: str) -> list[str]:
+    sln_dir = os.path.dirname(sln_path)
+    found: list[str] = []
+
+    try:
+        with open(sln_path, encoding="utf-8-sig", errors="replace") as f:
+            content = f.read()
+        for m in re.finditer(
+            r'"([^\"]+\.(?:csproj|fsproj|vbproj))"',
+            content,
+            re.IGNORECASE,
+        ):
+            full = _resolve_solution_project_path(sln_dir, m.group(1))
+            if full and full not in found:
+                found.append(full)
+    except Exception:
+        pass
+
+    return found
+
+
+def _parse_slnx(slnx_path: str) -> list[str]:
+    slnx_dir = os.path.dirname(slnx_path)
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def visit(node: ET.Element):
+        for raw in node.attrib.values():
+            full = _resolve_solution_project_path(slnx_dir, raw)
+            if full and full not in seen:
+                seen.add(full)
+                found.append(full)
+        for child in list(node):
+            visit(child)
+
+    try:
+        root = ET.parse(slnx_path).getroot()
+        visit(root)
+    except Exception:
+        pass
+
+    return found
 
 
 def _write_user_config(user_sources: list[NuGetSource],
@@ -1123,7 +1191,7 @@ class NuGetManagerApp:
         # Row 2: source / search
         row2 = ctk.CTkFrame(bar, fg_color="transparent")
         row2.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
-        row2.grid_columnconfigure(4, weight=1)
+        row2.grid_columnconfigure(3, weight=1)
 
         ctk.CTkLabel(row2, text="Package source:",
                      font=ctk.CTkFont(weight="bold")
@@ -1149,7 +1217,7 @@ class NuGetManagerApp:
         self._search_entry = ctk.CTkEntry(
             row2, textvariable=self.search_var,
             width=480, placeholder_text="Search packages…")
-        self._search_entry.grid(row=0, column=3, sticky="ew")
+        self._search_entry.grid(row=0, column=3, sticky="ew", padx=(0, 8))
         self._search_entry.bind("<Return>", lambda _: self.start_search())
         self.root.bind("<Control-l>",
                        lambda _: (self._search_entry.focus_set(),
@@ -1157,7 +1225,7 @@ class NuGetManagerApp:
 
         ctk.CTkButton(row2, text="Search",
                       command=self.start_search, width=84
-                      ).grid(row=0, column=4)
+                      ).grid(row=0, column=4, padx=(0, 8))
 
     def _build_tabview(self):
         self.tabview = ctk.CTkTabview(self.root, corner_radius=8,
@@ -1456,21 +1524,39 @@ class NuGetManagerApp:
         ctk.CTkFrame(frame, height=1, fg_color=("gray80", "gray30")
                      ).grid(row=7, column=0, sticky="ew", pady=4)
 
+        proj_lbl = None
+        proj_box = None
+        info_row = 8
+        if mode == "installed":
+            proj_lbl = ctk.CTkLabel(
+                frame, text="Installed in projects", anchor="w",
+                font=ctk.CTkFont(weight="bold"))
+            proj_lbl.grid(row=8, column=0, sticky="ew", pady=(6, 2))
+
+            proj_box = ctk.CTkTextbox(
+                frame, height=84, wrap="word",
+                font=ctk.CTkFont(size=11),
+                activate_scrollbars=True)
+            proj_box.grid(row=9, column=0, sticky="ew", pady=(0, 8))
+            proj_box.configure(state="disabled")
+            info_row = 10
+
         dl_lbl = ctk.CTkLabel(frame, text="", anchor="w",
                               text_color=("gray45", "gray60"),
                               font=ctk.CTkFont(size=11))
-        dl_lbl.grid(row=8, column=0, sticky="ew", pady=(6, 2))
+        dl_lbl.grid(row=info_row, column=0, sticky="ew", pady=(6, 2))
 
         url_lbl = ctk.CTkLabel(frame, text="", anchor="w", cursor="hand2",
                                text_color=("#0078D4", "#4ea1f5"),
                                font=ctk.CTkFont(size=11))
-        url_lbl.grid(row=9, column=0, sticky="ew")
+        url_lbl.grid(row=info_row + 1, column=0, sticky="ew")
 
         return {
             "title":    title,    "author":   author,
             "ver_info": ver_info, "version":  ver_combo,
             "btn":      btn,      "desc":     desc,
             "dl":       dl_lbl,   "url":      url_lbl,
+            "proj_lbl": proj_lbl, "proj_box": proj_box,
             "bulk_btn": bulk_btn,
             "selected_btn": selected_btn,
         }
@@ -1623,18 +1709,9 @@ class NuGetManagerApp:
         self.load_projects()
 
     def _parse_sln(self, sln_path: str) -> list[str]:
-        sln_dir = os.path.dirname(sln_path)
-        found   = []
-        try:
-            with open(sln_path, encoding="utf-8-sig", errors="replace") as f:
-                content = f.read()
-            for m in re.finditer(r'"([^"]+\.csproj)"', content):
-                full = os.path.normpath(os.path.join(sln_dir, m.group(1)))
-                if os.path.isfile(full):
-                    found.append(full)
-        except Exception:
-            pass
-        return found
+        if sln_path.lower().endswith(".slnx"):
+            return _parse_slnx(sln_path)
+        return _parse_sln(sln_path)
 
     def load_projects(self):
         """Trigger async project loading in background thread."""
@@ -1655,9 +1732,10 @@ class NuGetManagerApp:
                                if d not in skip and not d.startswith(".")]
                 for f in filenames:
                     full = os.path.join(dirpath, f)
-                    if f.endswith(".sln"):
+                    lower = f.lower()
+                    if lower.endswith(_SOLUTION_FILE_EXTENSIONS):
                         sln_files.append(full)
-                    elif f.endswith(".csproj"):
+                    elif lower.endswith(_PROJECT_FILE_EXTENSIONS):
                         csproj_files.append(full)
 
             entries  = []
@@ -1691,7 +1769,7 @@ class NuGetManagerApp:
         if not self.entries:
             self.project_combo.configure(values=["No projects found"])
             self.project_combo.set("No projects found")
-            self.status_var.set("No .sln or .csproj files found.")
+            self.status_var.set("No .sln, .slnx, or .csproj files found.")
         else:
             self.project_combo.configure(values=display)
             self.project_combo.set(display[0])
@@ -2191,11 +2269,18 @@ class NuGetManagerApp:
         def run():
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(by_project) or 1)) as ex:
                 errors = [e for e in ex.map(run_one_project, by_project.items()) if e]
-            if errors:
-                self.root.after(0, self._show_error, "\n".join(errors))
+            total_projects = len(by_project)
+            successful_projects = total_projects - len(errors)
+            outcome = _operation_outcome(total_projects, len(errors))
+            if outcome == "failure":
+                self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
+            elif outcome == "partial":
+                self.root.after(
+                    0, self._on_bulk_partial,
+                    package_count, total_projects, successful_projects, errors)
             else:
                 self.root.after(0, self._on_bulk_success,
-                                package_count, project_count)
+                                package_count, total_projects)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -2291,11 +2376,18 @@ class NuGetManagerApp:
         def run():
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(by_project) or 1)) as ex:
                 errors = [e for e in ex.map(run_one_project, by_project.items()) if e]
-            if errors:
-                self.root.after(0, self._show_error, "\n".join(errors))
+            total_projects = len(by_project)
+            successful_projects = total_projects - len(errors)
+            outcome = _operation_outcome(total_projects, len(errors))
+            if outcome == "failure":
+                self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
+            elif outcome == "partial":
+                self.root.after(
+                    0, self._on_bulk_partial,
+                    package_count, total_projects, successful_projects, errors)
             else:
                 self.root.after(0, self._on_bulk_success,
-                                package_count, project_count)
+                                package_count, total_projects)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -2305,15 +2397,44 @@ class NuGetManagerApp:
         self.updates_list.clear_marks()
         self.status_var.set(
             f"Updated {package_count} package(s) across {project_count} project(s).")
-        messagebox.showinfo(
-            "Success",
-            f"Updated {package_count} package(s) across {project_count} project(s).")
         for p in (self.browse_panel, self.installed_panel, self.updates_panel):
             p["btn"].configure(state="normal")
             if p.get("bulk_btn") is not None:
                 p["bulk_btn"].configure(state="normal")
             if p.get("selected_btn") is not None:
                 p["selected_btn"].configure(state="normal")
+        self._refresh_updates_bulk_button()
+
+    def _on_bulk_partial(self, package_count: int, total_projects: int,
+                         successful_projects: int, errors: list[str]):
+        failed_projects = max(0, total_projects - successful_projects)
+        self.refresh_installed(refresh_updates_after=True)
+        self._set_loading(False)
+        self.updates_list.clear_marks()
+
+        self.status_var.set(
+            f"Updated {package_count} package(s) in "
+            f"{successful_projects} of {total_projects} project(s).")
+
+        details = (
+            f"Updated {package_count} package(s) in "
+            f"{successful_projects} of {total_projects} project(s).\n"
+            f"{failed_projects} project(s) failed.\n\n"
+            "Failed projects:\n"
+            f"{chr(10).join(errors)}"
+        )
+        _log_error(f"Partial update: {successful_projects}/{total_projects}\n"
+                   + "\n".join(errors))
+        log_path = os.path.join(_app_storage_dir(), "nurestore.log")
+        CopyableErrorDialog(self.root, "Partial Update", details, log_path)
+
+        for p in (self.browse_panel, self.installed_panel, self.updates_panel):
+            p["btn"].configure(state="normal")
+            if p.get("bulk_btn") is not None:
+                p["bulk_btn"].configure(state="normal")
+            if p.get("selected_btn") is not None:
+                p["selected_btn"].configure(state="normal")
+        self._refresh_updates_bulk_button()
 
     def _on_update_select(self, pkg_id: str):
         upd = next((u for u in self.updates_data if u["id"] == pkg_id), None)
@@ -2372,6 +2493,28 @@ class NuGetManagerApp:
         else:
             panel["url"].configure(text="")
             panel["url"].unbind("<Button-1>")
+
+        proj_lbl = panel.get("proj_lbl")
+        proj_box = panel.get("proj_box")
+        if proj_lbl is not None and proj_box is not None:
+            total_projects = len(self._get_projects())
+            installed_count = len(in_projects)
+            proj_lbl.configure(
+                text=f"Installed in {installed_count} of {total_projects} project(s)")
+
+            display_paths = []
+            for proj in dict.fromkeys(in_projects):
+                try:
+                    rel = os.path.relpath(proj, self.base_dir).replace("\\", "/")
+                    display_paths.append(rel)
+                except Exception:
+                    display_paths.append(proj)
+
+            proj_text = "\n".join(display_paths) if display_paths else "—"
+            proj_box.configure(state="normal")
+            proj_box.delete("1.0", "end")
+            proj_box.insert("end", proj_text)
+            proj_box.configure(state="disabled")
 
         panel["btn"].configure(state="normal" if in_projects else "disabled")
         if mode == "browse":
@@ -2450,9 +2593,15 @@ class NuGetManagerApp:
 
         def run():
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-                errors = [e for e in ex.map(run_one, projects) if e]
-            if errors:
-                self.root.after(0, self._show_error, "\n".join(errors))
+                results = list(ex.map(run_one, projects))
+            errors = [e for e in results if e]
+            outcome = _operation_outcome(len(results), len(errors))
+            if outcome == "failure":
+                self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
+            elif outcome == "partial":
+                self.root.after(
+                    0, self._on_partial_success,
+                    verb, pkg_id, len(results) - len(errors), len(results), errors)
             else:
                 self.root.after(0, self._on_success, verb, pkg_id, n)
 
@@ -2482,7 +2631,6 @@ class NuGetManagerApp:
                         version_inline=True)
 
         self.status_var.set(f"{past} {pkg_id}{suffix}.")
-        messagebox.showinfo("Success", f"{past} {pkg_id}{suffix}.")
         for p in (self.browse_panel, self.installed_panel, self.updates_panel):
             p["btn"].configure(state="normal")
             if p.get("bulk_btn") is not None:
@@ -2491,14 +2639,42 @@ class NuGetManagerApp:
                 p["selected_btn"].configure(state="normal")
         self._refresh_updates_bulk_button()
 
-    def _show_error(self, msg: str):
+    def _on_partial_success(self, verb: str, pkg_id: str,
+                            success_count: int, total_count: int,
+                            errors: list[str]):
+        past = "Installed" if verb == "Installing" else "Uninstalled"
+        self.refresh_installed()
+        self._set_loading(False)
+
+        self.status_var.set(
+            f"{past} {pkg_id} in {success_count} of {total_count} project(s).")
+        details = (
+            f"{past} {pkg_id} in {success_count} of {total_count} project(s).\n"
+            f"{len(errors)} project(s) failed.\n\n"
+            "Failed projects:\n"
+            f"{chr(10).join(errors)}"
+        )
+        _log_error(f"Partial operation for {pkg_id}: {success_count}/{total_count}\n"
+                   + "\n".join(errors))
+        log_path = os.path.join(_app_storage_dir(), "nurestore.log")
+        CopyableErrorDialog(self.root, "Partial Success", details, log_path)
+
+        for p in (self.browse_panel, self.installed_panel, self.updates_panel):
+            p["btn"].configure(state="normal")
+            if p.get("bulk_btn") is not None:
+                p["bulk_btn"].configure(state="normal")
+            if p.get("selected_btn") is not None:
+                p["selected_btn"].configure(state="normal")
+        self._refresh_updates_bulk_button()
+
+    def _show_error(self, msg: str, title: str = "Update Error"):
         self.status_var.set("Ready")
         self._set_loading(False)
         # Log the error to file
-        _log_error(f"Update error: {msg}")
+        _log_error(f"{title}: {msg}")
         # Show custom copyable error dialog
         log_path = os.path.join(_app_storage_dir(), "nurestore.log")
-        CopyableErrorDialog(self.root, "Update Error", msg, log_path)
+        CopyableErrorDialog(self.root, title, msg, log_path)
         for p in (self.browse_panel, self.installed_panel, self.updates_panel):
             p["btn"].configure(state="normal")
             if p.get("bulk_btn") is not None:
