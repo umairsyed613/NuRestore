@@ -1140,10 +1140,26 @@ class NuGetManagerApp:
         self.load_projects()
 
     def _persist_settings(self):
-        _save_settings({
-            "last_base_dir": self.base_dir,
-            "loaded_config_path": self.loaded_config_path,
-        })
+        try:
+            _save_settings({
+                "last_base_dir": self.base_dir,
+                "loaded_config_path": self.loaded_config_path,
+            })
+        except PermissionError as exc:
+            messagebox.showerror(
+                "Settings Save Failed",
+                f"Could not save settings — permission denied:\n{exc.filename}\n\n"
+                "If NuRestore is installed in a protected location (e.g. inside "
+                "Python's site-packages), run it as an administrator or reinstall "
+                "to a user-writable location.",
+                parent=self.root,
+            )
+        except OSError as exc:
+            messagebox.showerror(
+                "Settings Save Failed",
+                f"Could not save settings:\n{exc}",
+                parent=self.root,
+            )
 
     # ── UI layout ─────────────────────────────────────────────────────────────
 
