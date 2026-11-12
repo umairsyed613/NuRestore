@@ -76,6 +76,17 @@ Install scope behavior:
 .\scripts\install_cli.ps1 -AllUsers
 ```
 
+If NuRestore is already installed, the script shows the installed and new
+versions and asks whether to remove the old one and install the new one.
+Pass `-Force` to skip the prompt:
+
+```powershell
+.\scripts\install_cli.ps1 -Force
+```
+
+The version lives in one place, `__version__` in `nurestore.py` (bump it for each
+release). It is shown in the window title and printed by `nurestore --version`.
+
 After installation you can launch the app from any folder:
 
 ```powershell
@@ -84,6 +95,9 @@ nurestore
 
 # Opens with a specific directory
 nurestore D:\MyProject
+
+# Prints the installed version
+nurestore --version
 ```
 
 ### Build portable `.exe`

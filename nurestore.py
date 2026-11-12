@@ -16,6 +16,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 
+# Single source of truth for the app version. pyproject.toml reads this
+# (dynamic version), the window title shows it, and scripts/install_cli.ps1
+# compares it with the installed version.
+__version__ = "1.1.0"
+
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("green")
 
@@ -113,6 +118,89 @@ def _operation_outcome(total_count: int, error_count: int) -> str:
     if error_count >= total_count:
         return "failure"
     return "partial"
+
+
+def _resolve_target_version(upd: dict, chosen: dict[str, str]) -> str:
+    """Version to install for an update entry: the user's pick, else the latest."""
+    picked = chosen.get(upd.get("id", ""), "")
+    if picked and picked in upd.get("versions", []):
+        return picked
+    return upd.get("latest", "")
+
+
+# Restore failures caused by another process touching the same files
+# (obj/ assets, project files). They succeed when simply tried again.
+_TRANSIENT_RESTORE_MARKERS = (
+    "Cannot create a file when that file already exists",
+    "being used by another process",
+)
+
+
+def _dotnet_run_kwargs(project: str) -> dict:
+    kw: dict = {"cwd": os.path.dirname(project)}
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kw["startupinfo"] = si
+    return kw
+
+
+def _apply_package_updates(by_project: dict[str, list[tuple[str, str | None]]],
+                           config_file: str | None,
+                           max_workers: int = 4) -> list[str]:
+    """Add/upgrade packages in every project, then restore, returning errors.
+
+    Works in two phases so that a restore never sees a half-edited solution:
+    1. ``dotnet add package --no-restore`` for every project (parallel; each
+       call only edits its own project file).
+    2. ``dotnet restore`` one project at a time. A restore also restores the
+       referenced projects, so running restores in parallel makes them fight
+       over the same obj/ files and read sibling projects that have not been
+       updated yet, producing bogus NU1605/NU1608 downgrade errors.
+    """
+    def add_packages(item: tuple[str, list[tuple[str, str | None]]]) -> str | None:
+        project, pkg_updates = item
+        try:
+            kw = _dotnet_run_kwargs(project)
+            for pkg_id, version in pkg_updates:
+                cmd = ["dotnet", "add", project, "package", pkg_id]
+                if version and version != "—":
+                    cmd += ["--version", version]
+                cmd.append("--no-restore")
+                res = subprocess.run(cmd, capture_output=True, text=True, **kw)
+                if res.returncode != 0:
+                    return (f"{os.path.basename(project)} / {pkg_id}: "
+                            f"{(res.stderr or res.stdout).strip()}")
+        except Exception as e:
+            return f"{os.path.basename(project)}: {e}"
+        return None
+
+    workers = max(1, min(max_workers, len(by_project)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        add_errors = list(ex.map(add_packages, by_project.items()))
+
+    errors = [e for e in add_errors if e]
+    failed_projects = {project for project, e in zip(by_project, add_errors) if e}
+
+    for project in by_project:
+        if project in failed_projects:
+            continue
+        try:
+            kw = _dotnet_run_kwargs(project)
+            cmd = ["dotnet", "restore", project]
+            if config_file:
+                cmd += ["--configfile", config_file]
+            res = subprocess.run(cmd, capture_output=True, text=True, **kw)
+            if res.returncode != 0:
+                output = (res.stderr or res.stdout).strip()
+                if any(m in output for m in _TRANSIENT_RESTORE_MARKERS):
+                    res = subprocess.run(cmd, capture_output=True, text=True, **kw)
+                    output = (res.stderr or res.stdout).strip()
+                if res.returncode != 0:
+                    errors.append(f"{os.path.basename(project)}: {output}")
+        except Exception as e:
+            errors.append(f"{os.path.basename(project)}: {e}")
+    return errors
 
 
 _PROJECT_FILE_EXTENSIONS = (".csproj", ".fsproj", ".vbproj")
@@ -868,6 +956,7 @@ class PackageList(ctk.CTkScrollableFrame):
                       padx=(0, 4), pady=name_pady)
 
         widgets = [row, name_lbl, indicator]
+        badge_widget = None
 
         if version_inline and version:
             version_inline_lbl = ctk.CTkLabel(
@@ -892,6 +981,8 @@ class PackageList(ctk.CTkScrollableFrame):
             meta_lbl.grid(row=0, column=col_offset + 3, sticky="e",
                           padx=(0, 10), pady=name_pady)
             widgets.append(meta_lbl)
+            if badge and not downloads:
+                badge_widget = (meta_lbl, "{}")
 
         # Checkbox positioned at column 0 (left edge) with smaller size
         mark_var = None
@@ -946,6 +1037,7 @@ class PackageList(ctk.CTkScrollableFrame):
                     text_color=badge_color)
                 badge_lbl.pack(side="left")
                 widgets.append(badge_lbl)
+                badge_widget = (badge_lbl, "  {}")
 
         def set_state(state: str):
             if state == "selected":
@@ -982,7 +1074,15 @@ class PackageList(ctk.CTkScrollableFrame):
                                "compact": compact,
                                "has_author": has_author,
                                "has_meta": has_meta,
-                               "mark_var": mark_var}
+                               "mark_var": mark_var,
+                               "badge_widget": badge_widget}
+
+    def set_badge(self, pkg_id: str, badge: str):
+        item = self._items.get(pkg_id)
+        if not item or not item.get("badge_widget"):
+            return
+        label, template = item["badge_widget"]
+        label.configure(text=template.format(badge))
 
     def _on_mark(self, pkg_id: str, var: tk.BooleanVar):
         if self._on_mark_changed:
@@ -1109,7 +1209,7 @@ class CopyableErrorDialog(ctk.CTkToplevel):
 class NuGetManagerApp:
     def __init__(self, root: ctk.CTk):
         self.root = root
-        self.root.title("NuRestore")
+        self.root.title(f"NuRestore v{__version__}")
         self.root.geometry("1200x740")
         self.root.minsize(960, 600)
 
@@ -1131,7 +1231,9 @@ class NuGetManagerApp:
         self.browse_results: list           = []
         self.installed_pkgs: list           = []
         self.updates_data: list             = []
-        self._loading_count                 = 0
+        # Version the user picked in the dropdown per package id (Updates tab).
+        self.update_target_versions: dict[str, str] = {}
+        self._loading_count                = 0
         self._svc_cache_lock                = threading.Lock()
         self.include_prerelease             = tk.BooleanVar(value=False)
         self.base_dir_var                   = tk.StringVar(value=self.base_dir)
@@ -1531,7 +1633,8 @@ class NuGetManagerApp:
                      font=ctk.CTkFont(weight="bold"), anchor="w"
                      ).grid(row=5, column=0, sticky="ew")
 
-        desc = ctk.CTkTextbox(frame, height=130, wrap="word",
+        desc = ctk.CTkTextbox(frame, height=130 if mode == "browse" else 90,
+                              wrap="word",
                               font=ctk.CTkFont(size=12),
                               activate_scrollbars=True)
         desc.grid(row=6, column=0, sticky="ew", pady=(4, 10))
@@ -1540,32 +1643,32 @@ class NuGetManagerApp:
         ctk.CTkFrame(frame, height=1, fg_color=("gray80", "gray30")
                      ).grid(row=7, column=0, sticky="ew", pady=4)
 
+        dl_lbl = ctk.CTkLabel(frame, text="", anchor="w",
+                              text_color=("gray45", "gray60"),
+                              font=ctk.CTkFont(size=11))
+        dl_lbl.grid(row=8, column=0, sticky="ew", pady=(6, 2))
+
+        url_lbl = ctk.CTkLabel(frame, text="", anchor="w", cursor="hand2",
+                               text_color=("#0078D4", "#4ea1f5"),
+                               font=ctk.CTkFont(size=11))
+        url_lbl.grid(row=9, column=0, sticky="ew")
+
+        # Projects that use the selected package, anchored at the bottom.
         proj_lbl = None
         proj_box = None
-        info_row = 8
-        if mode == "installed":
+        if mode in ("installed", "updates"):
             proj_lbl = ctk.CTkLabel(
                 frame, text="Installed in projects", anchor="w",
                 font=ctk.CTkFont(weight="bold"))
-            proj_lbl.grid(row=8, column=0, sticky="ew", pady=(6, 2))
+            proj_lbl.grid(row=10, column=0, sticky="ew", pady=(10, 2))
 
             proj_box = ctk.CTkTextbox(
                 frame, height=84, wrap="word",
                 font=ctk.CTkFont(size=11),
                 activate_scrollbars=True)
-            proj_box.grid(row=9, column=0, sticky="ew", pady=(0, 8))
+            proj_box.grid(row=11, column=0, sticky="nsew", pady=(0, 4))
             proj_box.configure(state="disabled")
-            info_row = 10
-
-        dl_lbl = ctk.CTkLabel(frame, text="", anchor="w",
-                              text_color=("gray45", "gray60"),
-                              font=ctk.CTkFont(size=11))
-        dl_lbl.grid(row=info_row, column=0, sticky="ew", pady=(6, 2))
-
-        url_lbl = ctk.CTkLabel(frame, text="", anchor="w", cursor="hand2",
-                               text_color=("#0078D4", "#4ea1f5"),
-                               font=ctk.CTkFont(size=11))
-        url_lbl.grid(row=info_row + 1, column=0, sticky="ew")
+            frame.grid_rowconfigure(11, weight=1)
 
         return {
             "title":    title,    "author":   author,
@@ -2179,6 +2282,10 @@ class NuGetManagerApp:
     def _show_updates(self, results: list):
         self._set_loading(False)
         self.updates_data = results
+        # Forget picks that no longer apply to the refreshed update list.
+        self.update_target_versions = {
+            pid: ver for pid, ver in self.update_target_versions.items()
+            if any(u["id"] == pid and ver in u["versions"] for u in results)}
         n = len(results)
         project_count = len(self._get_projects())
         solution_mode = self._is_solution()
@@ -2189,9 +2296,7 @@ class NuGetManagerApp:
             self._refresh_updates_bulk_button()
             return
         for u in results:
-            scope_badge = _project_scope_badge(
-                len(u["in_projects"]), project_count, solution_mode)
-            badge = f"→ {u['latest']} {scope_badge}".strip()
+            badge = self._update_badge(u, project_count, solution_mode)
             self.updates_list.add_item(
                 u["id"], version=u["installed"],
                 badge=badge,
@@ -2200,105 +2305,40 @@ class NuGetManagerApp:
         self.status_var.set(f"{n} update{'s' if n != 1 else ''} available.")
         self._refresh_updates_bulk_button()
 
+    def _update_badge(self, upd: dict, project_count: int,
+                      solution_mode: bool) -> str:
+        scope_badge = _project_scope_badge(
+            len(upd["in_projects"]), project_count, solution_mode)
+        target = _resolve_target_version(upd, self.update_target_versions)
+        return f"→ {target} {scope_badge}".strip()
+
+    def _on_target_version_chosen(self, pkg_id: str, version: str):
+        upd = next((u for u in self.updates_data if u["id"] == pkg_id), None)
+        if not upd or version not in upd["versions"]:
+            return
+        self.update_target_versions[pkg_id] = version
+        self.updates_list.set_badge(
+            pkg_id,
+            self._update_badge(upd, len(self._get_projects()), self._is_solution()))
+
+    def _collect_update_tasks(self, updates: list[dict]) -> list[tuple[str, str, str]]:
+        tasks: list[tuple[str, str, str]] = []
+        for upd in updates:
+            pkg_id = upd.get("id", "")
+            version = _resolve_target_version(upd, self.update_target_versions)
+            for project in upd.get("in_projects", []):
+                if pkg_id and version and project:
+                    tasks.append((project, pkg_id, version))
+        # Keep deterministic order while de-duplicating work.
+        return list(dict.fromkeys(tasks))
+
     def _run_update_all(self):
         if not self.updates_data:
             messagebox.showinfo("Updates", "No updates available.")
             return
-
-        tasks: list[tuple[str, str, str]] = []
-        for upd in self.updates_data:
-            pkg_id = upd.get("id", "")
-            latest = upd.get("latest", "")
-            for project in upd.get("in_projects", []):
-                if pkg_id and latest and project:
-                    tasks.append((project, pkg_id, latest))
-
-        # Keep deterministic order while de-duplicating work.
-        tasks = list(dict.fromkeys(tasks))
-        package_count = len({pkg for _proj, pkg, _ver in tasks})
-        project_count = len({proj for proj, _pkg, _ver in tasks})
-        command_count = len(tasks)
-
-        if not tasks:
-            messagebox.showinfo("Updates", "No applicable update tasks found.")
-            return
-
-        if not messagebox.askyesno(
-                "Update All Packages",
-                (f"Update {package_count} package(s) across {project_count} project(s)?\n"
-                 f"This will run {command_count} dotnet command(s)."),
-                parent=self.root):
-            return
-
-        self.status_var.set(
-            f"Updating {package_count} package(s) across {project_count} project(s)…")
-        self._set_loading(True)
-        for p in (self.browse_panel, self.installed_panel, self.updates_panel):
-            p["btn"].configure(state="disabled")
-            if p.get("bulk_btn") is not None:
-                p["bulk_btn"].configure(state="disabled")
-
-        # Determine which config file to use for dotnet commands
-        config_file = None
-        if self.loaded_config_path and os.path.isfile(self.loaded_config_path):
-            config_file = self.loaded_config_path
-        else:
-            user_config = _user_config_path()
-            if os.path.isfile(user_config):
-                config_file = user_config
-
-        by_project: dict[str, list[tuple[str, str]]] = {}
-        for project, pkg_id, version in tasks:
-            by_project.setdefault(project, []).append((pkg_id, version))
-
-        def run_one_project(item: tuple[str, list[tuple[str, str]]]) -> str | None:
-            project, pkg_updates = item
-            try:
-                kw = {}
-                if os.name == "nt":
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    kw["startupinfo"] = si
-                kw["cwd"] = os.path.dirname(project)
-
-                for pkg_id, version in pkg_updates:
-                    add_cmd = [
-                        "dotnet", "add", project, "package", pkg_id,
-                        "--version", version, "--no-restore"
-                    ]
-                    add_res = subprocess.run(add_cmd, capture_output=True, text=True, **kw)
-                    if add_res.returncode != 0:
-                        return (f"{os.path.basename(project)} / {pkg_id}: "
-                                f"{(add_res.stderr or add_res.stdout).strip()}")
-
-                restore_cmd = ["dotnet", "restore", project]
-                if config_file:
-                    restore_cmd += ["--configfile", config_file]
-                restore_res = subprocess.run(restore_cmd, capture_output=True, text=True, **kw)
-                if restore_res.returncode != 0:
-                    return (f"{os.path.basename(project)}: "
-                            f"{(restore_res.stderr or restore_res.stdout).strip()}")
-            except Exception as e:
-                return f"{os.path.basename(project)}: {e}"
-            return None
-
-        def run():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(by_project) or 1)) as ex:
-                errors = [e for e in ex.map(run_one_project, by_project.items()) if e]
-            total_projects = len(by_project)
-            successful_projects = total_projects - len(errors)
-            outcome = _operation_outcome(total_projects, len(errors))
-            if outcome == "failure":
-                self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
-            elif outcome == "partial":
-                self.root.after(
-                    0, self._on_bulk_partial,
-                    package_count, total_projects, successful_projects, errors)
-            else:
-                self.root.after(0, self._on_bulk_success,
-                                package_count, total_projects)
-
-        threading.Thread(target=run, daemon=True).start()
+        self._run_bulk_update(
+            self._collect_update_tasks(self.updates_data),
+            "Update All Packages", "package(s)")
 
     def _run_update_selected(self):
         marked = self.updates_list.get_marked_ids()
@@ -2310,33 +2350,35 @@ class NuGetManagerApp:
         if not selected_updates:
             messagebox.showinfo("Updates", "Selected packages are not in the current update list.")
             return
+        self._run_bulk_update(
+            self._collect_update_tasks(selected_updates),
+            "Update Selected Packages", "selected package(s)")
 
-        tasks: list[tuple[str, str, str]] = []
-        for upd in selected_updates:
-            pkg_id = upd.get("id", "")
-            latest = upd.get("latest", "")
-            for project in upd.get("in_projects", []):
-                if pkg_id and latest and project:
-                    tasks.append((project, pkg_id, latest))
+    def _run_bulk_update(self, tasks: list[tuple[str, str, str]],
+                         title: str, noun: str):
+        if not tasks:
+            messagebox.showinfo("Updates", "No applicable update tasks found.")
+            return
 
-        tasks = list(dict.fromkeys(tasks))
         package_count = len({pkg for _proj, pkg, _ver in tasks})
         project_count = len({proj for proj, _pkg, _ver in tasks})
         command_count = len(tasks)
 
-        if not tasks:
-            messagebox.showinfo("Updates", "No applicable update tasks for selected packages.")
-            return
+        versions_by_pkg = dict.fromkeys((pkg, ver) for _proj, pkg, ver in tasks)
+        preview = [f"  {pkg} → {ver}" for pkg, ver in versions_by_pkg][:12]
+        if len(versions_by_pkg) > len(preview):
+            preview.append(f"  … and {len(versions_by_pkg) - len(preview)} more")
 
         if not messagebox.askyesno(
-                "Update Selected Packages",
-                (f"Update {package_count} selected package(s) across {project_count} project(s)?\n"
-                 f"This will run {command_count} dotnet command(s)."),
+                title,
+                (f"Update {package_count} {noun} across {project_count} project(s)?\n"
+                 f"This will run {command_count} dotnet command(s).\n\n"
+                 + "\n".join(preview)),
                 parent=self.root):
             return
 
         self.status_var.set(
-            f"Updating {package_count} selected package(s) across {project_count} project(s)…")
+            f"Updating {package_count} {noun} across {project_count} project(s)…")
         self._set_loading(True)
         for p in (self.browse_panel, self.installed_panel, self.updates_panel):
             p["btn"].configure(state="disabled")
@@ -2345,55 +2387,17 @@ class NuGetManagerApp:
             if p.get("selected_btn") is not None:
                 p["selected_btn"].configure(state="disabled")
 
-        # Determine which config file to use for dotnet commands
-        config_file = None
-        if self.loaded_config_path and os.path.isfile(self.loaded_config_path):
-            config_file = self.loaded_config_path
-        else:
-            user_config = _user_config_path()
-            if os.path.isfile(user_config):
-                config_file = user_config
+        config_file = self._dotnet_config_file()
 
-        by_project: dict[str, list[tuple[str, str]]] = {}
+        by_project: dict[str, list[tuple[str, str | None]]] = {}
         for project, pkg_id, version in tasks:
             by_project.setdefault(project, []).append((pkg_id, version))
 
-        def run_one_project(item: tuple[str, list[tuple[str, str]]]) -> str | None:
-            project, pkg_updates = item
-            try:
-                kw = {}
-                if os.name == "nt":
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    kw["startupinfo"] = si
-                kw["cwd"] = os.path.dirname(project)
-
-                for pkg_id, version in pkg_updates:
-                    add_cmd = [
-                        "dotnet", "add", project, "package", pkg_id,
-                        "--version", version, "--no-restore"
-                    ]
-                    add_res = subprocess.run(add_cmd, capture_output=True, text=True, **kw)
-                    if add_res.returncode != 0:
-                        return (f"{os.path.basename(project)} / {pkg_id}: "
-                                f"{(add_res.stderr or add_res.stdout).strip()}")
-
-                restore_cmd = ["dotnet", "restore", project]
-                if config_file:
-                    restore_cmd += ["--configfile", config_file]
-                restore_res = subprocess.run(restore_cmd, capture_output=True, text=True, **kw)
-                if restore_res.returncode != 0:
-                    return (f"{os.path.basename(project)}: "
-                            f"{(restore_res.stderr or restore_res.stdout).strip()}")
-            except Exception as e:
-                return f"{os.path.basename(project)}: {e}"
-            return None
-
         def run():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(by_project) or 1)) as ex:
-                errors = [e for e in ex.map(run_one_project, by_project.items()) if e]
+            errors = _apply_package_updates(by_project, config_file)
             total_projects = len(by_project)
-            successful_projects = total_projects - len(errors)
+            # One error entry per failed project.
+            successful_projects = max(0, total_projects - len(errors))
             outcome = _operation_outcome(total_projects, len(errors))
             if outcome == "failure":
                 self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
@@ -2406,6 +2410,13 @@ class NuGetManagerApp:
                                 package_count, total_projects)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _dotnet_config_file(self) -> str | None:
+        """Loaded custom NuGet config if available, else the user config."""
+        if self.loaded_config_path and os.path.isfile(self.loaded_config_path):
+            return self.loaded_config_path
+        user_config = _user_config_path()
+        return user_config if os.path.isfile(user_config) else None
 
     def _on_bulk_success(self, package_count: int, project_count: int):
         self.refresh_installed(refresh_updates_after=True)
@@ -2492,10 +2503,19 @@ class NuGetManagerApp:
         versions = [v["version"] for v in pkg_data.get("versions", [])]
         if versions:
             panel["version"].configure(values=versions)
-            panel["version"].set(versions[0])
+            remembered = self.update_target_versions.get(pkg_id, "")
+            panel["version"].set(
+                remembered if mode == "updates" and remembered in versions
+                else versions[0])
         else:
             panel["version"].configure(values=["—"])
             panel["version"].set("—")
+
+        # In the Updates tab, remember the pick so "Update Selected" / "Update
+        # All" install exactly this version instead of silently using latest.
+        panel["version"].configure(
+            command=(lambda v, pid=pkg_id: self._on_target_version_chosen(pid, v))
+            if mode == "updates" else None)
 
         dl = pkg_data.get("totalDownloads")
         panel["dl"].configure(
@@ -2560,64 +2580,39 @@ class NuGetManagerApp:
         for p in (self.browse_panel, self.installed_panel, self.updates_panel):
             p["btn"].configure(state="disabled")
 
-        # Determine which config file to use for dotnet commands
-        # Use the loaded custom config if available, otherwise use the default user config
-        config_file = None
-        if self.loaded_config_path and os.path.isfile(self.loaded_config_path):
-            config_file = self.loaded_config_path
-        else:
-            user_config = _user_config_path()
-            if os.path.isfile(user_config):
-                config_file = user_config
+        config_file = self._dotnet_config_file()
 
-        def run_one(project: str) -> str | None:
+        def remove_one(project: str) -> str | None:
             try:
-                kw = {}
-                if os.name == "nt":
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    kw["startupinfo"] = si
-                kw["cwd"] = os.path.dirname(project)
-
-                if action == "add":
-                    add_cmd = ["dotnet", "add", project, "package", pkg_id]
-                    if version and version != "—":
-                        add_cmd += ["--version", version]
-                    add_cmd += ["--no-restore"]
-
-                    add_res = subprocess.run(add_cmd, capture_output=True, text=True, **kw)
-                    if add_res.returncode != 0:
-                        return (f"{os.path.basename(project)}: "
-                                f"{(add_res.stderr or add_res.stdout).strip()}")
-
-                    restore_cmd = ["dotnet", "restore", project]
-                    if config_file:
-                        restore_cmd += ["--configfile", config_file]
-                    restore_res = subprocess.run(restore_cmd, capture_output=True, text=True, **kw)
-                    if restore_res.returncode != 0:
-                        return (f"{os.path.basename(project)}: "
-                                f"{(restore_res.stderr or restore_res.stdout).strip()}")
-                else:
-                    remove_cmd = ["dotnet", action, project, "package", pkg_id]
-                    remove_res = subprocess.run(remove_cmd, capture_output=True, text=True, **kw)
-                    if remove_res.returncode != 0:
-                        return (f"{os.path.basename(project)}: "
-                                f"{(remove_res.stderr or remove_res.stdout).strip()}")
+                remove_cmd = ["dotnet", action, project, "package", pkg_id]
+                remove_res = subprocess.run(
+                    remove_cmd, capture_output=True, text=True,
+                    **_dotnet_run_kwargs(project))
+                if remove_res.returncode != 0:
+                    return (f"{os.path.basename(project)}: "
+                            f"{(remove_res.stderr or remove_res.stdout).strip()}")
             except Exception as e:
                 return f"{os.path.basename(project)}: {e}"
             return None
 
         def run():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-                results = list(ex.map(run_one, projects))
-            errors = [e for e in results if e]
-            outcome = _operation_outcome(len(results), len(errors))
+            unique_projects = list(dict.fromkeys(projects))
+            if action == "add":
+                # Edit every project first, then restore one at a time.
+                errors = _apply_package_updates(
+                    {proj: [(pkg_id, version)] for proj in unique_projects},
+                    config_file)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                    errors = [e for e in ex.map(remove_one, unique_projects) if e]
+            total = len(unique_projects)
+            outcome = _operation_outcome(total, len(errors))
             if outcome == "failure":
                 self.root.after(0, self._show_error, "\n".join(errors), "Update Error")
             elif outcome == "partial":
                 self.root.after(
                     0, self._on_partial_success,
-                    verb, pkg_id, len(results) - len(errors), len(results), errors)
+                    verb, pkg_id, total - len(errors), total, errors)
             else:
                 self.root.after(0, self._on_success, verb, pkg_id, n)
 
@@ -2636,10 +2631,8 @@ class NuGetManagerApp:
                 self.updates_list.message("All packages are up to date.")
             else:
                 for u in self.updates_data:
-                    scope_badge = _project_scope_badge(
-                        len(u["in_projects"]), len(self._get_projects()),
-                        self._is_solution())
-                    badge = f"→ {u['latest']} {scope_badge}".strip()
+                    badge = self._update_badge(
+                        u, len(self._get_projects()), self._is_solution())
                     self.updates_list.add_item(
                         u["id"], version=u["installed"],
                         badge=badge,
@@ -2701,6 +2694,9 @@ class NuGetManagerApp:
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"NuRestore {__version__}")
+        return
     root = ctk.CTk()
     NuGetManagerApp(root)
     root.mainloop()

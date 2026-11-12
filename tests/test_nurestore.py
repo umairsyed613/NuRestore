@@ -1,7 +1,10 @@
 import os
 import tempfile
 import textwrap
+import threading
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import customtkinter as ctk
 
@@ -31,6 +34,173 @@ class OperationOutcomeTests(unittest.TestCase):
     def test_operation_outcome_failure(self):
         self.assertEqual(nm._operation_outcome(5, 5), "failure")
         self.assertEqual(nm._operation_outcome(0, 0), "failure")
+
+
+class ResolveTargetVersionTests(unittest.TestCase):
+    UPD = {"id": "Microsoft.EntityFrameworkCore", "latest": "11.0.0",
+           "versions": ["10.0.14", "10.0.15", "11.0.0"]}
+
+    def test_defaults_to_latest(self):
+        self.assertEqual(nm._resolve_target_version(self.UPD, {}), "11.0.0")
+
+    def test_uses_chosen_version_not_latest(self):
+        chosen = {"Microsoft.EntityFrameworkCore": "10.0.15"}
+        self.assertEqual(nm._resolve_target_version(self.UPD, chosen), "10.0.15")
+
+    def test_ignores_stale_choice(self):
+        chosen = {"Microsoft.EntityFrameworkCore": "9.9.9"}
+        self.assertEqual(nm._resolve_target_version(self.UPD, chosen), "11.0.0")
+
+
+class ApplyPackageUpdatesTests(unittest.TestCase):
+    PROJECTS = {
+        "C:/r/A/A.csproj": [("Pkg.One", "10.0.15"), ("Pkg.Two", "10.0.15")],
+        "C:/r/B/B.csproj": [("Pkg.One", "10.0.15")],
+        "C:/r/C/C.csproj": [("Pkg.Two", "10.0.15")],
+    }
+
+    def _run(self, fake):
+        with mock.patch.object(nm.subprocess, "run", side_effect=fake):
+            return nm._apply_package_updates(
+                {k: list(v) for k, v in self.PROJECTS.items()}, None)
+
+    def test_all_edits_finish_before_any_restore_and_restores_never_overlap(self):
+        lock = threading.Lock()
+        calls: list[str] = []
+        active = {"restores": 0, "max_restores": 0}
+
+        def fake(cmd, **_kw):
+            kind = cmd[1]
+            with lock:
+                calls.append(kind)
+                if kind == "restore":
+                    active["restores"] += 1
+                    active["max_restores"] = max(
+                        active["max_restores"], active["restores"])
+            if kind == "restore":
+                threading.Event().wait(0.02)
+                with lock:
+                    active["restores"] -= 1
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.assertEqual(self._run(fake), [])
+        self.assertEqual(calls.count("add"), 4)
+        self.assertEqual(calls.count("restore"), 3)
+        first_restore = calls.index("restore")
+        self.assertNotIn("add", calls[first_restore:])
+        self.assertEqual(active["max_restores"], 1)
+
+    def test_exact_version_is_passed_to_dotnet_add(self):
+        seen = []
+
+        def fake(cmd, **_kw):
+            if cmd[1] == "add":
+                seen.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self._run(fake)
+        for cmd in seen:
+            self.assertEqual(cmd[cmd.index("--version") + 1], "10.0.15")
+            self.assertIn("--no-restore", cmd)
+
+    def test_failed_add_skips_restore_for_that_project_only(self):
+        restored = []
+
+        def fake(cmd, **_kw):
+            if cmd[1] == "add" and cmd[2].endswith("B.csproj"):
+                return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            if cmd[1] == "restore":
+                restored.append(cmd[2])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        errors = self._run(fake)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("B.csproj / Pkg.One: boom", errors[0])
+        self.assertEqual(sorted(restored),
+                         ["C:/r/A/A.csproj", "C:/r/C/C.csproj"])
+
+    def test_transient_restore_error_is_retried_once(self):
+        attempts = {"n": 0}
+
+        def fake(cmd, **_kw):
+            if cmd[1] == "restore" and cmd[2].endswith("A.csproj"):
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    return SimpleNamespace(
+                        returncode=1, stdout="",
+                        stderr="error : Cannot create a file when that file "
+                               "already exists.")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.assertEqual(self._run(fake), [])
+        self.assertEqual(attempts["n"], 2)
+
+    def test_real_restore_error_is_reported_without_retry(self):
+        attempts = {"n": 0}
+
+        def fake(cmd, **_kw):
+            if cmd[1] == "restore" and cmd[2].endswith("A.csproj"):
+                attempts["n"] += 1
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="error NU1202: incompatible")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        errors = self._run(fake)
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("NU1202", errors[0])
+
+
+class UpdateSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.app = object.__new__(nm.NuGetManagerApp)
+        self.app.update_target_versions = {}
+        self.upd_ef = {"id": "Microsoft.EntityFrameworkCore", "installed": "10.0.10",
+                       "latest": "11.0.0",
+                       "versions": ["10.0.14", "10.0.15", "11.0.0"],
+                       "in_projects": ["C:/r/A/A.csproj", "C:/r/B/B.csproj"]}
+        self.upd_http = {"id": "Microsoft.Extensions.Http", "installed": "10.0.10",
+                         "latest": "11.0.0", "versions": ["10.0.15", "11.0.0"],
+                         "in_projects": ["C:/r/A/A.csproj"]}
+
+    def test_update_selected_uses_dropdown_version_not_latest(self):
+        self.app.update_target_versions = {
+            "Microsoft.EntityFrameworkCore": "10.0.15",
+            "Microsoft.Extensions.Http": "10.0.15"}
+        tasks = self.app._collect_update_tasks([self.upd_ef, self.upd_http])
+        self.assertEqual(
+            {(pkg, ver) for _proj, pkg, ver in tasks},
+            {("Microsoft.EntityFrameworkCore", "10.0.15"),
+             ("Microsoft.Extensions.Http", "10.0.15")})
+        self.assertEqual(len(tasks), 3)
+
+    def test_unpicked_package_still_defaults_to_latest(self):
+        self.app.update_target_versions = {"Microsoft.Extensions.Http": "10.0.15"}
+        tasks = self.app._collect_update_tasks([self.upd_ef, self.upd_http])
+        versions = {pkg: ver for _p, pkg, ver in tasks}
+        self.assertEqual(versions["Microsoft.EntityFrameworkCore"], "11.0.0")
+        self.assertEqual(versions["Microsoft.Extensions.Http"], "10.0.15")
+
+    def test_badge_reflects_picked_version(self):
+        self.app.update_target_versions = {"Microsoft.Extensions.Http": "10.0.15"}
+        self.assertEqual(self.app._update_badge(self.upd_http, 1, False), "→ 10.0.15")
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_is_semver(self):
+        self.assertRegex(nm.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_pyproject_reads_version_from_module(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('dynamic = ["version"]', text)
+        self.assertIn('attr = "nurestore.__version__"', text)
+
+    def test_install_script_reads_same_version_pattern(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "scripts", "install_cli.ps1")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("__version__", f.read())
 
 
 class NuGetSourceTests(unittest.TestCase):

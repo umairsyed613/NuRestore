@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nurestore"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Lightweight GUI tool for managing NuGet packages on .NET projects"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -18,6 +18,9 @@ nurestore = "nurestore:main"
 
 [tool.setuptools]
 py-modules = ["nurestore"]
+
+[tool.setuptools.dynamic]
+version = { attr = "nurestore.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
